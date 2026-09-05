@@ -2396,6 +2396,9 @@ for step in range(train_steps + 1):
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
+        if last_step and endgame_ema is not None:
+            print0(f"EMA_COST gpu_ms:{endgame_ema.gpu_ms:.1f} updates:{endgame_ema.n_updates} "
+                   f"per_update_ms:{endgame_ema.gpu_ms/max(endgame_ema.n_updates,1):.3f}", console=True)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         if last_step and endgame_ema is not None and os.environ.get("EMA_SWEEP_GAMMAS"):
             _pbl = {lbl: p for lbl, p in training_manager.optimizer._param_by_label.items()}
