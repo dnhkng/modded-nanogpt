@@ -2353,6 +2353,8 @@ if ema_horizon > 0:
         skip_labels=("bigram_embed",),
         stride=int(os.environ.get("EMA_STRIDE", "1")),
     )
+    endgame_ema.extra_strides = [int(x) for x in
+        os.environ.get("EMA_EXTRA_STRIDES", "").split(",") if x.strip()]
     training_manager.optimizer.ema = endgame_ema
     print0(f"Endgame EMA: horizon={ema_horizon} gamma={ema_gamma} "
            f"start_step={endgame_ema.start_step}", console=True)
@@ -2411,7 +2413,26 @@ for step in range(train_steps + 1):
                         _vl += model(_i,_t,_c,_b, training_manager.get_forward_args()).mean()
                 _vl /= val_steps
                 dist.reduce(_vl, 0, op=dist.ReduceOp.AVG)
-                print0(f"EMA_SWEEP gamma:{_g:.3f} val_loss:{_vl:.4f}", console=True)
+                print0(f"EMA_SWEEP stride:{endgame_ema.stride} gamma:{_g:.3f} val_loss:{_vl:.4f}", console=True)
+            for _st in endgame_ema.extra_strides:
+                _main = endgame_ema.state
+                endgame_ema.state = endgame_ema.extra_state.get(_st, {})
+                for _g in [float(x) for x in os.environ["EMA_SWEEP_GAMMAS"].split(",") if x.strip()]:
+                    with torch.no_grad():
+                        for lbl, p in _pbl.items(): p.copy_(_saved[lbl])
+                    endgame_ema.blend_(_pbl, _g, gather=_gather_full_ema)
+                    _v2 = 0
+                    _l2 = distributed_data_generator(args.val_files, args.val_batch_size, -1,
+                                                     grad_accum_steps=grad_accum_steps, align_to_bos=False)
+                    with torch.no_grad():
+                        for _ in range(val_steps):
+                            _i,_t,_c,_b,_ = next(_l2)
+                            _v2 += model(_i,_t,_c,_b, training_manager.get_forward_args()).mean()
+                    _v2 /= val_steps
+                    dist.reduce(_v2, 0, op=dist.ReduceOp.AVG)
+                    print0(f"EMA_SWEEP stride:{_st} gamma:{_g:.3f} val_loss:{_v2:.4f}", console=True)
+                    del _l2
+                endgame_ema.state = _main
                 del _vl_loader
             with torch.no_grad():
                 for lbl, p in _pbl.items(): p.copy_(_saved[lbl])

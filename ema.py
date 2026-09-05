@@ -63,6 +63,9 @@ class EndgameEMA:
         self.stride = stride
         self.state: dict[str, Tensor] = {}
         self._stream: torch.cuda.Stream | None = None
+        # extra strides accumulated alongside, for a single-run comparison
+        self.extra_strides: list[int] = []
+        self.extra_state: dict[int, dict[str, Tensor]] = {}
 
     def update_many(self, pending: "list[tuple[str, Tensor]]", step: int) -> None:
         """Apply all shards at once, on a side stream, off the critical path."""
@@ -74,6 +77,21 @@ class EndgameEMA:
         cur = torch.cuda.current_stream()
         self._stream.wait_stream(cur)
         with torch.cuda.stream(self._stream):
+            for st in self.extra_strides:
+                if (step - self.start_step) % st:
+                    continue
+                a = min(1.0, st / self.horizon)
+                tgt = self.extra_state.setdefault(st, {})
+                for label, p_slice in pending:
+                    if label in self.skip_labels:
+                        continue
+                    sl = p_slice.detach()
+                    if not sl.is_contiguous():
+                        sl = sl.contiguous()
+                    if label not in tgt:
+                        tgt[label] = sl.float().clone()
+                    else:
+                        fused_ema_(tgt[label], sl, a)
             for label, p_slice in pending:
                 if label in self.skip_labels:
                     continue
