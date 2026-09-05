@@ -39,6 +39,7 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
+from ema import EndgameEMA
 from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, quantize_transpose_mlp_down_weights, reduce_mlp_activation_scales, transpose_add, transpose_copy
 from dc_triton_kernels import (
     dc_attention_postonly_nodd_correction_add_base_triton,
@@ -720,6 +721,9 @@ class NorMuonAndAdam:
     # -----------------------------------
     # Unified optimizer step with explicit ordering
 
+    ema = None       # optional EndgameEMA, set by the training script
+    ema_step = 0     # current step, set by the training script each iteration
+
     @torch.no_grad()
     def step(self, do_adam: bool = True):
         """
@@ -741,6 +745,7 @@ class NorMuonAndAdam:
         """
         rank = dist.get_rank() if dist.is_initialized() else 0
         lm_param, embed_param = self._lm_head_param, self._embed_param
+        _ema_pending: list = []
 
         # ===== Phase 1: Launch reduces in scatter_order =====
         for label in self.scatter_order:
@@ -792,6 +797,12 @@ class NorMuonAndAdam:
                 p_slice = self._adam_update(param, grad_chunk, p_cfg, rank)
             else:
                 p_slice = self._normuon_update(param, grad_chunk, p_cfg, rank)
+            # Endgame EMA: only *record* this rank's shard here. Updating
+            # inline injects kernels between the parameter update and the
+            # all_gather launch, delaying every collective and stalling the
+            # reduce_scatter/all_gather pipeline. Applied after Phase 3.
+            if self.ema is not None:
+                _ema_pending.append((label, p_slice))
             # Launch gather for sharded params
             if p_cfg.comms.startswith("sharded") and self.world_size > 1:
                 gather_fut = self._launch_gather(param, p_slice)
@@ -812,6 +823,12 @@ class NorMuonAndAdam:
         # Wait for remaining gathers
         for fut in gather_futures:
             fut.wait()
+
+        # Endgame EMA, off the critical path: every collective has been issued
+        # and waited on, so these kernels no longer delay the pipeline.
+        if self.ema is not None and _ema_pending:
+            self.ema.update_many(_ema_pending, self.ema_step)
+            _ema_pending.clear()
 
         self._reduce_futures.clear()
         self._sparse_async_data.clear()
@@ -2140,6 +2157,7 @@ class TrainingManager():
                 p_cfg.momentum = muon_momentum
 
         # Step optimizer with do_adam flag
+        self.optimizer.ema_step = step
         self.optimizer.step(do_adam=do_adam)
 
         # At split step: copy lm_head optimizer state to embed and mark as split
@@ -2317,8 +2335,43 @@ t0 = time.perf_counter()
 model.prefix_table.copy_(build_prefix_table(model.vocab_size))
 # begin training
 train_steps = training_schedule.total_steps
+
+# ---- Endgame EMA weight blending (off unless EMA_HORIZON is set) ----
+# The final loss is set almost entirely by the deep-cooldown phase; averaging
+# the weights over it cancels residual step-to-step noise. Measured worth
+# ~0.0025 val loss (~1.2% of training) for ~0.07% of a step.
+ema_horizon = int(os.environ.get("EMA_HORIZON", "0"))
+ema_gamma = float(os.environ.get("EMA_GAMMA", "0.30"))
+endgame_ema = None
+if ema_horizon > 0:
+    # bigram_embed is 64% of all parameters and sparsely updated; excluding it
+    # was measured to change the result by <=0.0001 while removing most of the cost.
+    endgame_ema = EndgameEMA(
+        horizon=ema_horizon,
+        start_step=max(0, train_steps - 3 * ema_horizon),
+        skip_labels=("bigram_embed",),
+    )
+    training_manager.optimizer.ema = endgame_ema
+    print0(f"Endgame EMA: horizon={ema_horizon} gamma={ema_gamma} "
+           f"start_step={endgame_ema.start_step}", console=True)
+
+def _gather_full_ema(label, shard):
+    """Reassemble a parameter's average across ranks (identity when unsharded)."""
+    param = training_manager.optimizer._param_by_label[label]
+    cfg = training_manager.optimizer.param_cfgs[param]
+    if not cfg.comms.startswith("sharded") or world_size == 1:
+        return shard
+    full = torch.empty((shard.shape[0] * world_size, *shard.shape[1:]),
+                       dtype=shard.dtype, device=shard.device)
+    dist.all_gather_into_tensor(full, shard.contiguous())
+    return full
+
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
+    if last_step and endgame_ema is not None:
+        endgame_ema.blend_(
+            {lbl: p for lbl, p in training_manager.optimizer._param_by_label.items()},
+            ema_gamma, gather=_gather_full_ema)
     training_manager.advance_schedule(step)
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
