@@ -83,6 +83,15 @@ class EndgameEMA:
             if param is None:
                 continue
             full = shard if gather is None else gather(label, shard)
-            if full.shape != param.shape:  # shard did not cover the parameter
-                continue
+            if full.shape != param.shape:
+                # NorMuon banks are sharded on a *reshaped* view -- mlp_bank's
+                # (12, 2, ...) is flattened to (24, ...) -- so the gathered
+                # average is correct but differently shaped. Merging leading
+                # dims preserves row order, so this is a pure view.
+                if full.numel() != param.numel():
+                    raise RuntimeError(
+                        f"EMA shape mismatch for {label}: gathered {tuple(full.shape)} "
+                        f"vs param {tuple(param.shape)}. Refusing to skip silently."
+                    )
+                full = full.reshape(param.shape)
             param.copy_(param.float().lerp(full, gamma).to(param.dtype))
