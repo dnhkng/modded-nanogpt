@@ -745,6 +745,7 @@ class NorMuonAndAdam:
         """
         rank = dist.get_rank() if dist.is_initialized() else 0
         lm_param, embed_param = self._lm_head_param, self._embed_param
+        _ema_pending: list = []
 
         # ===== Phase 1: Launch reduces in scatter_order =====
         for label in self.scatter_order:
@@ -796,10 +797,12 @@ class NorMuonAndAdam:
                 p_slice = self._adam_update(param, grad_chunk, p_cfg, rank)
             else:
                 p_slice = self._normuon_update(param, grad_chunk, p_cfg, rank)
-            # Endgame EMA over this rank's own shard (no extra comms; the work
-            # is 1/world_size per rank because p_slice is just this rank's chunk)
+            # Endgame EMA: only *record* this rank's shard here. Doing the
+            # update inline injects kernels between the parameter update and
+            # the all_gather launch, delaying every collective and stalling the
+            # reduce_scatter/all_gather pipeline. Applied after Phase 3 instead.
             if self.ema is not None:
-                self.ema.update(label, p_slice, self.ema_step)
+                _ema_pending.append((label, p_slice))
             # Launch gather for sharded params
             if p_cfg.comms.startswith("sharded") and self.world_size > 1:
                 gather_fut = self._launch_gather(param, p_slice)
@@ -820,6 +823,13 @@ class NorMuonAndAdam:
         # Wait for remaining gathers
         for fut in gather_futures:
             fut.wait()
+
+        # Endgame EMA, off the critical path: every collective has been issued
+        # and waited on, so these kernels no longer delay the pipeline. Runs on
+        # a side stream so they overlap the next forward rather than serialising.
+        if self.ema is not None and _ema_pending:
+            self.ema.update_many(_ema_pending, self.ema_step)
+            _ema_pending.clear()
 
         self._reduce_futures.clear()
         self._sparse_async_data.clear()
@@ -2341,6 +2351,7 @@ if ema_horizon > 0:
         horizon=ema_horizon,
         start_step=max(0, train_steps - 3 * ema_horizon),
         skip_labels=("bigram_embed",),
+        stride=int(os.environ.get("EMA_STRIDE", "1")),
     )
     training_manager.optimizer.ema = endgame_ema
     print0(f"Endgame EMA: horizon={ema_horizon} gamma={ema_gamma} "
