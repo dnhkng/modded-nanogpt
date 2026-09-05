@@ -2414,8 +2414,14 @@ for step in range(train_steps + 1):
                 _vl /= val_steps
                 dist.reduce(_vl, 0, op=dist.ReduceOp.AVG)
                 print0(f"EMA_SWEEP stride:{endgame_ema.stride} gamma:{_g:.3f} val_loss:{_vl:.4f}", console=True)
+            print0(f"EMA_STATE main={len(endgame_ema.state)} "
+                   + " ".join(f"stride{k}={len(v)}" for k, v in endgame_ema.extra_state.items()),
+                   console=True)
             for _st in endgame_ema.extra_strides:
                 _main = endgame_ema.state
+                if not endgame_ema.extra_state.get(_st):
+                    print0(f"EMA_SWEEP stride:{_st} SKIPPED (no state accumulated)", console=True)
+                    continue
                 endgame_ema.state = endgame_ema.extra_state.get(_st, {})
                 for _g in [float(x) for x in os.environ["EMA_SWEEP_GAMMAS"].split(",") if x.strip()]:
                     with torch.no_grad():
