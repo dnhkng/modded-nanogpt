@@ -2359,7 +2359,7 @@ def _gather_full_ema(label, shard):
 
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
-    if last_step and endgame_ema is not None:
+    if last_step and endgame_ema is not None and not os.environ.get("EMA_SWEEP_GAMMAS"):
         endgame_ema.blend_(
             {lbl: p for lbl, p in training_manager.optimizer._param_by_label.items()},
             ema_gamma, gather=_gather_full_ema)
@@ -2384,6 +2384,27 @@ for step in range(train_steps + 1):
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        if last_step and endgame_ema is not None and os.environ.get("EMA_SWEEP_GAMMAS"):
+            _pbl = {lbl: p for lbl, p in training_manager.optimizer._param_by_label.items()}
+            _saved = {lbl: p.detach().clone() for lbl, p in _pbl.items()}
+            for _g in [float(x) for x in os.environ["EMA_SWEEP_GAMMAS"].split(",") if x.strip()]:
+                with torch.no_grad():
+                    for lbl, p in _pbl.items(): p.copy_(_saved[lbl])
+                endgame_ema.blend_(_pbl, _g, gather=_gather_full_ema)
+                _vl = 0
+                _vl_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1,
+                                                        grad_accum_steps=grad_accum_steps, align_to_bos=False)
+                with torch.no_grad():
+                    for _ in range(val_steps):
+                        _i,_t,_c,_b,_ = next(_vl_loader)
+                        _vl += model(_i,_t,_c,_b, training_manager.get_forward_args()).mean()
+                _vl /= val_steps
+                dist.reduce(_vl, 0, op=dist.ReduceOp.AVG)
+                print0(f"EMA_SWEEP gamma:{_g:.3f} val_loss:{_vl:.4f}", console=True)
+                del _vl_loader
+            with torch.no_grad():
+                for lbl, p in _pbl.items(): p.copy_(_saved[lbl])
+            del _saved
         model.train()
         # start the clock again
         torch.cuda.synchronize()
